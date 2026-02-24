@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"sync"
 	"time"
 
@@ -33,13 +34,14 @@ const (
 
 // Config configures a Node.
 type Config struct {
-	Keys       *crypto.KeyPair
-	Transport  transport.Transport
-	Directory  *directory.Directory
-	Rate       time.Duration   // broadcast interval; defaults to defaultRate
-	Bootstrap  []string        // peer addresses to connect on start
-	Listen     string          // TCP listen address (ignored when Transport is provided)
-	ProxyAddr  string          // SOCKS5 proxy bind address
+	Keys        *crypto.KeyPair
+	Transport   transport.Transport
+	Directory   *directory.Directory
+	Rate        time.Duration   // broadcast interval; defaults to defaultRate
+	Bootstrap   []string        // peer addresses to connect on start
+	Listen      string          // TCP listen address (ignored when Transport is provided)
+	ProxyAddr   string          // SOCKS5 proxy bind address
+	ExposePort  int             // local TCP port to expose as a hidden service (0 = not hosting)
 }
 
 // IncomingMessage is delivered to callers via the Messages() channel.
@@ -56,6 +58,7 @@ type Node struct {
 	dir      *directory.Directory
 	sendQ    chan protocol.Packet
 	messages chan IncomingMessage
+	sessions *SessionManager
 
 	stopOnce sync.Once
 	stopCh   chan struct{}
@@ -83,6 +86,7 @@ func New(cfg Config) (*Node, error) {
 		messages: make(chan IncomingMessage, 64),
 		stopCh:   make(chan struct{}),
 	}
+	n.sessions = newSessionManager(n, cfg.ExposePort)
 	return n, nil
 }
 
@@ -118,13 +122,18 @@ func (n *Node) Messages() <-chan IncomingMessage {
 // Send encrypts and queues a message to the given recipient public key.
 // The message is transmitted at the next scheduled broadcast tick.
 func (n *Node) Send(recipientPubHex string, content string) error {
+	return n.sendTyped(recipientPubHex, MsgTypeDirect, content)
+}
+
+// sendTyped is the internal send with explicit message type.
+func (n *Node) sendTyped(recipientPubHex string, msgType MessageType, content string) error {
 	recipientPub, err := crypto.PubKeyFromHex(recipientPubHex)
 	if err != nil {
 		return fmt.Errorf("node: invalid recipient key: %w", err)
 	}
 
 	env := Envelope{
-		Type:    MsgTypeDirect,
+		Type:    msgType,
 		From:    n.cfg.Keys.PublicKeyHex(),
 		Content: content,
 	}
@@ -224,6 +233,17 @@ func (n *Node) RegisterName(name string) error {
 	default:
 	}
 	return nil
+}
+
+// Sessions returns the node's SessionManager for TCP-over-Lethe tunneling.
+func (n *Node) Sessions() *SessionManager {
+	return n.sessions
+}
+
+// DialSession opens a TCP-over-Lethe session to peerPubHex on the given port.
+// Implements proxy.Dialer. Returns a net.Conn bridging to the remote service.
+func (n *Node) DialSession(peerPubHex string, port int) (net.Conn, error) {
+	return n.sessions.Dial(peerPubHex, port)
 }
 
 // LookupName resolves a human-readable name to an enc_pub hex key.
@@ -331,6 +351,10 @@ func (n *Node) tryDecrypt(pkt protocol.Packet) {
 	}
 
 	switch env.Type {
+	case MsgTypeSession:
+		n.sessions.Handle(env)
+		return // don't deliver to messages channel
+
 	case MsgTypeDirect:
 		select {
 		case n.messages <- IncomingMessage{From: env.From, Content: env.Content}:

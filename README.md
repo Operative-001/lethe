@@ -170,19 +170,46 @@ lethe send bob "hello"
 lethe send a3f4b2c1d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a2 "hello"
 ```
 
+### Host a Hidden Service
+
+Run any local HTTP server and expose it anonymously through the network:
+
+```bash
+# Start your content server
+python3 -m http.server 8080
+# or: nginx, node, flask, anything on any port
+
+# Expose it via Lethe (no server, no domain, no IP revealed)
+lethe daemon --expose 8080
+
+# Register a human-readable name
+# (from the daemon console type:)
+> register mysite
+```
+
+Anyone with your public key (printed on daemon start) can now reach your service:
+- Set SOCKS5 → `127.0.0.1:1080` in browser
+- Navigate to `http://<your-pubkey>.lethe/`
+- Or if you registered: `http://mysite.lethe/`
+
+No DNS. No CDN. No registrar. No IP address ever leaves your machine.
+
 ### Connect Two Nodes Locally (for testing)
 
 ```bash
-# Terminal 1 — Alice
-lethe keygen --data /tmp/alice
-lethe daemon --data /tmp/alice --listen 0.0.0.0:4242 --proxy 127.0.0.1:1080
+# Terminal 1 — Host: runs an HTTP server exposed via Lethe
+lethe keygen --data /tmp/host
+python3 -m http.server 8080 &
+lethe daemon --data /tmp/host --listen 0.0.0.0:4242 --expose 8080
 
-# Terminal 2 — Bob
-lethe keygen --data /tmp/bob
-lethe daemon --data /tmp/bob --listen 0.0.0.0:4243 --proxy 127.0.0.1:1081 \
+# Terminal 2 — Client: browses the hidden service
+lethe keygen --data /tmp/client
+lethe daemon --data /tmp/client --listen 0.0.0.0:4243 --proxy 127.0.0.1:1080 \
   --bootstrap 127.0.0.1:4242
 
-# From Bob's console: type 'send <alice-pubkey> hello alice'
+# Set browser SOCKS5 → 127.0.0.1:1080
+# Navigate to http://<host-pubkey>.lethe/
+# You're browsing via the anonymous tunnel — host never saw your IP
 ```
 
 ---
@@ -281,8 +308,8 @@ internal/node       — direct delivery, wrap-and-forward, deduplication, TTL
 
 ## Roadmap
 
-- **v0.1** (current): Core protocol, CLI, SOCKS5 proxy with .lethe address resolution
-- **v0.2**: Full TCP-over-Lethe tunneling (arbitrary HTTP/TCP through the network), daemon IPC socket for `lethe send` without console
+- **v0.1** (current): Core protocol, CLI, SOCKS5 proxy, TCP-over-Lethe tunneling, hidden service hosting (`--expose`), anonymous messaging
+- **v0.2**: Daemon IPC socket for `lethe send` without console, multi-hop relay chaining UI, persistent peer list
 - **v0.3**: Mobile library (iOS/Android via gomobile)
 - **v0.4**: Post-quantum key encapsulation (ML-KEM / Kyber-1024)
 - **v0.5**: Chaumian batch mixing mode for maximum anonymity (adds latency)

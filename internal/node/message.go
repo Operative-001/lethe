@@ -17,6 +17,10 @@ const (
 
 	// MsgTypeDirectoryEntry carries a key directory registration.
 	MsgTypeDirectoryEntry MessageType = "directory"
+
+	// MsgTypeSession carries a session control/data message for TCP-over-Lethe tunneling.
+	// Content field contains a JSON-encoded SessionMsg.
+	MsgTypeSession MessageType = "session"
 )
 
 // Envelope is the JSON structure inside every encrypted payload.

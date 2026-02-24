@@ -100,12 +100,15 @@ var daemonCmd = &cobra.Command{
 		defer dir.Close()
 
 		tr := transport.NewTCP(listen)
+		exposePort, _ := cmd.Flags().GetInt("expose")
+
 		n, err := node.New(node.Config{
-			Keys:      kp,
-			Transport: tr,
-			Directory: dir,
-			Bootstrap: bootstrapList,
-			Rate:      100 * time.Millisecond,
+			Keys:       kp,
+			Transport:  tr,
+			Directory:  dir,
+			Bootstrap:  bootstrapList,
+			Rate:       100 * time.Millisecond,
+			ExposePort: exposePort,
 		})
 		if err != nil {
 			return err
@@ -148,6 +151,9 @@ var daemonCmd = &cobra.Command{
 		fmt.Printf("  Listening : %s\n", listen)
 		fmt.Printf("  SOCKS5    : %s  ← set this in your browser\n", proxyAddr)
 		fmt.Printf("  Data      : %s\n", dataDir)
+		if exposePort > 0 {
+			fmt.Printf("  Exposing  : localhost:%d  ← hidden service active\n", exposePort)
+		}
 		if len(bootstrapList) > 0 {
 			fmt.Printf("  Bootstrap : %s\n", strings.Join(bootstrapList, ", "))
 		}
@@ -332,6 +338,7 @@ func init() {
 	daemonCmd.Flags().String("listen", "0.0.0.0:4242", "TCP listen address for peer connections")
 	daemonCmd.Flags().String("proxy", "127.0.0.1:1080", "SOCKS5 proxy address")
 	daemonCmd.Flags().StringSlice("bootstrap", []string{}, "Bootstrap peer addresses (host:port)")
+	daemonCmd.Flags().Int("expose", 0, "Local port to expose as a hidden service (0 = not hosting)")
 
 	rootCmd.AddCommand(keygenCmd, daemonCmd, sendCmd, registerCmd, statusCmd)
 }

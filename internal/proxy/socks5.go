@@ -1,12 +1,12 @@
 // Package proxy provides a SOCKS5 server for browser integration.
 //
 // Configure your browser to use SOCKS5 proxy at 127.0.0.1:1080.
-// .lethe addresses (e.g. alice.lethe) are resolved via the local key directory.
-// All other addresses are passed through directly (or rejected if exitPolicy=deny).
 //
-// Current implementation: SOCKS5 CONNECT for .lethe domains resolves the
-// enc_pub key and returns a diagnostic connection. Full TCP-over-Lethe tunneling
-// (streaming arbitrary TCP through the broadcast network) is tracked in v0.2.
+// .lethe addresses (e.g. alice.lethe or <pubkey>.lethe) are routed through
+// the Lethe anonymous network using the TCP-over-Lethe session protocol.
+// The connection is bidirectional and supports arbitrary HTTP/TCP traffic.
+//
+// Non-.lethe addresses are either passed through (allowExit=true) or rejected.
 package proxy
 
 import (
@@ -18,23 +18,26 @@ import (
 	"strings"
 )
 
-// Resolver maps .lethe hostnames to X25519 public key hex strings.
-type Resolver interface {
+// Dialer abstracts the TCP-over-Lethe session dialer.
+type Dialer interface {
+	// LookupName resolves a .lethe name to an enc_pub hex key.
 	LookupName(name string) (encPubHex string, ok bool)
+	// DialSession opens a TCP-over-Lethe session to the given enc_pub.
+	DialSession(peerPubHex string, port int) (net.Conn, error)
 }
 
 // Server is a minimal SOCKS5 proxy (RFC 1928, CONNECT method only).
 type Server struct {
 	listenAddr string
-	resolver   Resolver
-	allowExit  bool // if false, non-.lethe destinations are rejected
+	dialer     Dialer
+	allowExit  bool
 }
 
 // New creates a SOCKS5 Server.
-func New(listenAddr string, resolver Resolver, allowExit bool) *Server {
+func New(listenAddr string, dialer Dialer, allowExit bool) *Server {
 	return &Server{
 		listenAddr: listenAddr,
-		resolver:   resolver,
+		dialer:     dialer,
 		allowExit:  allowExit,
 	}
 }
@@ -58,23 +61,21 @@ func (s *Server) ListenAndServe() error {
 func (s *Server) handleConn(conn net.Conn) {
 	defer conn.Close()
 
-	// SOCKS5 handshake
 	if err := s.socks5Handshake(conn); err != nil {
 		return
 	}
 
-	// Read CONNECT request
-	dest, err := s.readRequest(conn)
+	dest, port, err := s.readRequest(conn)
 	if err != nil {
-		s.writeReply(conn, 0x07) // command not supported
+		s.writeReply(conn, 0x07)
 		return
 	}
 
-	host, _, _ := net.SplitHostPort(dest)
+	host := dest
 	isLethe := strings.HasSuffix(strings.ToLower(host), ".lethe")
 
 	if isLethe {
-		s.handleLetheConnect(conn, host)
+		s.handleLetheConnect(conn, host, port)
 		return
 	}
 
@@ -83,100 +84,115 @@ func (s *Server) handleConn(conn net.Conn) {
 		return
 	}
 
-	// Pass-through to real destination
-	upstream, err := net.Dial("tcp", dest)
+	upstream, err := net.Dial("tcp", fmt.Sprintf("%s:%d", dest, port))
 	if err != nil {
-		s.writeReply(conn, 0x05) // connection refused
+		s.writeReply(conn, 0x05)
 		return
 	}
 	defer upstream.Close()
 
-	s.writeReply(conn, 0x00) // success
+	s.writeReply(conn, 0x00)
 	go io.Copy(upstream, conn) //nolint:errcheck
 	io.Copy(conn, upstream)    //nolint:errcheck
 }
 
-// handleLetheConnect resolves the .lethe address and responds.
-// In v0.1, this confirms resolution and returns the public key as a banner.
-// Full TCP-over-Lethe tunneling is v0.2.
-func (s *Server) handleLetheConnect(conn net.Conn, host string) {
+// handleLetheConnect resolves the .lethe name, opens a Lethe session, and
+// bridges the browser's TCP connection bidirectionally through it.
+func (s *Server) handleLetheConnect(conn net.Conn, host string, port int) {
 	name := strings.TrimSuffix(strings.ToLower(host), ".lethe")
-	encPub, ok := s.resolver.LookupName(name)
+
+	// Resolve: try directory lookup first, then treat as raw pubkey
+	encPub, ok := s.dialer.LookupName(name)
 	if !ok {
-		s.writeReply(conn, 0x04) // host unreachable
-		return
+		// name might be a raw pubkey hex
+		if len(name) == 64 {
+			encPub = name
+		} else {
+			s.writeReply(conn, 0x04) // host unreachable
+			log.Printf("proxy: unknown .lethe address: %s", name)
+			return
+		}
 	}
 
-	s.writeReply(conn, 0x00) // success
-	// Send a banner so browser shows something useful
-	banner := fmt.Sprintf(
-		"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n"+
-			"Lethe node: %s\nAddress: %s.lethe\nKey: %s\n"+
-			"Full TCP tunneling: v0.2\n",
-		host, name, encPub,
-	)
-	conn.Write([]byte(banner)) //nolint:errcheck
+	// Open TCP-over-Lethe session
+	letheConn, err := s.dialer.DialSession(encPub, port)
+	if err != nil {
+		s.writeReply(conn, 0x05) // connection refused
+		log.Printf("proxy: lethe dial %s: %v", host, err)
+		return
+	}
+	defer letheConn.Close()
+
+	// Tell browser: connection established
+	s.writeReply(conn, 0x00)
+
+	// Bidirectional bridge: browser ↔ Lethe session
+	done := make(chan struct{}, 2)
+	go func() {
+		io.Copy(letheConn, conn) //nolint:errcheck
+		done <- struct{}{}
+	}()
+	go func() {
+		io.Copy(conn, letheConn) //nolint:errcheck
+		done <- struct{}{}
+	}()
+	<-done // close when either direction ends
 }
 
-// socks5Handshake negotiates no-auth (method 0x00).
 func (s *Server) socks5Handshake(conn net.Conn) error {
 	buf := make([]byte, 2)
 	if _, err := io.ReadFull(conn, buf); err != nil {
 		return err
 	}
 	if buf[0] != 0x05 {
-		return fmt.Errorf("proxy: not SOCKS5")
+		return fmt.Errorf("not SOCKS5")
 	}
 	nmethods := int(buf[1])
 	methods := make([]byte, nmethods)
 	if _, err := io.ReadFull(conn, methods); err != nil {
 		return err
 	}
-	// Accept no-auth
 	conn.Write([]byte{0x05, 0x00}) //nolint:errcheck
 	return nil
 }
 
-// readRequest reads a SOCKS5 CONNECT request and returns "host:port".
-func (s *Server) readRequest(conn net.Conn) (string, error) {
+func (s *Server) readRequest(conn net.Conn) (host string, port int, err error) {
 	hdr := make([]byte, 4)
-	if _, err := io.ReadFull(conn, hdr); err != nil {
-		return "", err
+	if _, err = io.ReadFull(conn, hdr); err != nil {
+		return
 	}
 	if hdr[0] != 0x05 || hdr[1] != 0x01 {
-		return "", fmt.Errorf("proxy: only CONNECT supported")
+		err = fmt.Errorf("only CONNECT supported")
+		return
 	}
 
-	var host string
 	switch hdr[3] {
-	case 0x01: // IPv4
+	case 0x01:
 		addr := make([]byte, 4)
 		io.ReadFull(conn, addr) //nolint:errcheck
 		host = net.IP(addr).String()
-	case 0x03: // domain name
+	case 0x03:
 		lenBuf := make([]byte, 1)
 		io.ReadFull(conn, lenBuf) //nolint:errcheck
 		domain := make([]byte, int(lenBuf[0]))
 		io.ReadFull(conn, domain) //nolint:errcheck
 		host = string(domain)
-	case 0x04: // IPv6
+	case 0x04:
 		addr := make([]byte, 16)
 		io.ReadFull(conn, addr) //nolint:errcheck
 		host = net.IP(addr).String()
 	default:
-		return "", fmt.Errorf("proxy: unknown address type %d", hdr[3])
+		err = fmt.Errorf("unknown address type %d", hdr[3])
+		return
 	}
 
 	portBuf := make([]byte, 2)
 	io.ReadFull(conn, portBuf) //nolint:errcheck
-	port := binary.BigEndian.Uint16(portBuf)
-
-	return fmt.Sprintf("%s:%d", host, port), nil
+	port = int(binary.BigEndian.Uint16(portBuf))
+	return
 }
 
-// writeReply sends a SOCKS5 reply with the given status code.
 func (s *Server) writeReply(conn net.Conn, status byte) {
-	// VER REP RSV ATYP BND.ADDR BND.PORT
 	reply := []byte{0x05, status, 0x00, 0x01, 0, 0, 0, 0, 0, 0}
 	conn.Write(reply) //nolint:errcheck
 }
